@@ -1,0 +1,18 @@
+# Environment
+venv/
+.venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# AI model weights
+*.pt
+
+# Generated output
+output/*
+!output/.gitkeep
+
+# Node
+node_modules/
