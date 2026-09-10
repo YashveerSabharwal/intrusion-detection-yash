@@ -39,7 +39,12 @@ class IncidentDetector:
             from ultralytics import YOLO
         except ImportError as e:
             raise RuntimeError(
-                "ultralytics is not installed. Run: pip install ultralytics"
+                f"Failed to import ultralytics -- this is NOT necessarily "
+                f"'not installed': it's often a broken/mismatched dependency "
+                f"(e.g. torch/torchvision version mismatch) surfacing as an "
+                f"ImportError during ultralytics' own import chain. "
+                f"Run `python -c \"from ultralytics import YOLO\"` directly "
+                f"to see the full traceback. Original error: {e}"
             ) from e
 
         try:
@@ -155,23 +160,40 @@ class IncidentDetector:
         Some real-world objects are geometrically indistinguishable from
         an alert category at the bounding-box level -- e.g. a standing
         dog's box is the same wide/short shape as a fallen person's box,
-        so MIN_ASPECT_RATIO can't separate them. For each (category,
-        suppressor) pair in config.SUPPRESSED_BY, drop any detection in
-        `category` that overlaps a same-frame detection in `suppressor`
-        by at least the configured IoU threshold.
+        so MIN_ASPECT_RATIO can't separate them.
+
+        config.SUPPRESSED_BY now holds a LIST of suppressor entries per
+        target category, and can include BOTH suppressor-only categories
+        (e.g. ANIMAL) and real alert categories (e.g. FIRE, SMOKE).
+        This method only handles the SUPPRESSOR-ONLY case (ANIMAL) --
+        it only ever sees zero-shot detections at this point in the
+        pipeline, which is fine for ANIMAL (zero-shot only, no
+        multi-model equivalent).
+
+        FIRE/SMOKE suppressing WEAPON/FALLEN_TREE is handled later, in
+        main.py's _suppress_by_confirmed_events(), AFTER zero-shot and
+        multi-model (Thalos) detections are merged -- doing it here would
+        miss a fire that only Thalos caught on a given frame.
         """
         to_drop = set()
-        for target_category, (suppressor_category, iou_threshold) in config.SUPPRESSED_BY.items():
-            suppressors = [d for d in detections if d.category == suppressor_category]
-            if not suppressors:
-                continue
-            for i, det in enumerate(detections):
-                if det.category != target_category or i in to_drop:
+        for target_category, suppressor_entries in config.SUPPRESSED_BY.items():
+            for entry in suppressor_entries:
+                suppressor_category = entry["category"]
+                if suppressor_category not in config.SUPPRESSOR_CATEGORIES:
+                    continue  # handled later in main.py instead
+
+                iou_threshold = entry["iou"]
+                suppressors = [d for d in detections if d.category == suppressor_category]
+                if not suppressors:
                     continue
-                for sup in suppressors:
-                    if self._iou(det.bbox, sup.bbox) >= iou_threshold:
-                        to_drop.add(i)
-                        break
+
+                for i, det in enumerate(detections):
+                    if det.category != target_category or i in to_drop:
+                        continue
+                    for sup in suppressors:
+                        if self._iou(det.bbox, sup.bbox) >= iou_threshold:
+                            to_drop.add(i)
+                            break
         return [d for i, d in enumerate(detections) if i not in to_drop]
 
     def _dedupe(self, detections, iou_threshold=0.5):

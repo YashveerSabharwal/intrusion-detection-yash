@@ -16,6 +16,8 @@ COLORS = {
     "WEAPON": (0, 0, 255),          # red
     "FALLEN_PERSON": (0, 255, 255), # yellow
     "FALLEN_TREE": (19, 69, 139),   # brown
+    "FIGHT": (0, 140, 255),         # dark orange -- distinct from FIRE's orange-red
+    "ELECTRICAL": (255, 255, 0),    # cyan -- distinct from FIRE/WEAPON's red family
 }
 
 

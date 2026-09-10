@@ -22,6 +22,8 @@ CATEGORY_COLORS = {
     "WEAPON": "#e53935",
     "FALLEN_PERSON": "#fbc02d",
     "FALLEN_TREE": "#8b5a2b",
+    "FIGHT": "#fb8c00",
+    "ELECTRICAL": "#00acc1",
 }
 
 
@@ -78,7 +80,7 @@ def build_report(output_path, video_info, category_data, alerts):
         "max_confidence": float,
         "confirmed": bool,
         "timeline": [(frame_idx, confidence), ...],   # 0.0 when absent
-        "top_detections": [(frame_idx, timestamp, confidence, thumb_b64), ...]
+        "top_detections": [(frame_idx, timestamp, confidence, thumb_b64, source), ...]
     }
     alerts: list of alert dicts (from alerts.json)
     """
@@ -106,13 +108,24 @@ def build_report(output_path, video_info, category_data, alerts):
         spark = _sparkline_svg(data["timeline"], data["threshold"], color)
 
         thumbs_html = ""
-        for frame_idx, ts, conf, thumb in data["top_detections"]:
+        for entry in data["top_detections"]:
+            # Tolerate both the old 4-tuple shape and the new 5-tuple
+            # shape (adds `source`), in case older report_stats data is
+            # ever passed in.
+            if len(entry) == 5:
+                frame_idx, ts, conf, thumb, source = entry
+            else:
+                frame_idx, ts, conf, thumb = entry
+                source = None
+
             if not thumb:
                 continue
+
+            source_html = f" &middot; <span class='source'>{source}</span>" if source else ""
             thumbs_html += f"""
             <div class="thumb">
               <img src="data:image/jpeg;base64,{thumb}" />
-              <div class="thumb-caption">{ts} &middot; conf {conf:.2f} &middot; frame {frame_idx}</div>
+              <div class="thumb-caption">{ts} &middot; conf {conf:.2f} &middot; frame {frame_idx}{source_html}</div>
             </div>"""
 
         if not thumbs_html:
@@ -138,6 +151,7 @@ def build_report(output_path, video_info, category_data, alerts):
     if alerts:
         for a in alerts:
             color = CATEGORY_COLORS.get(a["event"], "#333")
+            source = a.get("source", "")
             alerts_rows += f"""
             <tr>
               <td style="color:{color}"><b>{a['event']}</b></td>
@@ -145,10 +159,11 @@ def build_report(output_path, video_info, category_data, alerts):
               <td>{a['confidence']:.3f}</td>
               <td>{a['frame']}</td>
               <td>{a['bbox']}</td>
+              <td>{source}</td>
             </tr>"""
         alerts_table = f"""
         <table>
-          <thead><tr><th>Event</th><th>Timestamp</th><th>Confidence</th><th>Frame</th><th>BBox</th></tr></thead>
+          <thead><tr><th>Event</th><th>Timestamp</th><th>Confidence</th><th>Frame</th><th>BBox</th><th>Source</th></tr></thead>
           <tbody>{alerts_rows}</tbody>
         </table>
         """
@@ -176,6 +191,7 @@ def build_report(output_path, video_info, category_data, alerts):
   .thumbs {{ display:flex; gap:12px; flex-wrap:wrap; }}
   .thumb img {{ display:block; border-radius:6px; max-width:220px; }}
   .thumb-caption {{ font-size:11px; color:#666; margin-top:4px; text-align:center; }}
+  .thumb-caption .source {{ font-style:italic; color:#888; }}
   .no-thumbs {{ font-size:13px; color:#999; font-style:italic; }}
   table {{ width:100%; border-collapse:collapse; font-size:13px; }}
   th, td {{ text-align:left; padding:8px 10px; border-bottom:1px solid #eee; }}
@@ -186,7 +202,7 @@ def build_report(output_path, video_info, category_data, alerts):
 </head>
 <body>
   <h1>CCTV Incident Analysis Report</h1>
-  <p class="subtitle">Zero-shot YOLO-World prototype &middot; generated automatically after each run</p>
+  <p class="subtitle">YOLO-World + dedicated model prototype &middot; generated automatically after each run</p>
 
   <div class="meta">
     <table>

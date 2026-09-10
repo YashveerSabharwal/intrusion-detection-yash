@@ -14,17 +14,27 @@ class TemporalTracker:
     def __init__(self, window=None, min_hits=None):
         self.window = window or config.TEMPORAL_WINDOW
         self.min_hits = min_hits or config.MIN_HITS
+
+        # BUGFIX: previously only config.CATEGORY_PROMPTS' 5 keys were
+        # tracked here. FIGHT/ELECTRICAL (config.MODEL_BASED_CATEGORIES)
+        # have no zero-shot prompts, so they were never in this dict --
+        # meaning `confirmed` never contained "FIGHT" or "ELECTRICAL",
+        # no matter how confidently FightDetector/ElectricalArcDetector
+        # fired. main.py and report.py already included these two
+        # categories correctly; this was the one file that missed them.
+        all_categories = list(config.CATEGORY_PROMPTS) + config.MODEL_BASED_CATEGORIES
+
         self.history = {
-            category: deque(maxlen=self.window) for category in config.CATEGORY_PROMPTS
+            category: deque(maxlen=self.window) for category in all_categories
         }
         # best detection seen in the current window, per category
         # (used so the alert/overlay has a representative bbox+confidence)
-        self.best_in_window = {category: None for category in config.CATEGORY_PROMPTS}
+        self.best_in_window = {category: None for category in all_categories}
 
     def update(self, detections_this_frame):
         """
         detections_this_frame: list of Detection objects from detector.infer()
-        Returns dict: {category: confirmed(bool)} for every category.
+        Returns dict: {category: confirmed(bool)} for every tracked category.
         """
         present_categories = {}
         for det in detections_this_frame:

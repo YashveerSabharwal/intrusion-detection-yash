@@ -1,13 +1,13 @@
 """
 main.py
-CCTV incident detection prototype (V1) -- YOLO-World + prompts + temporal
-confirmation, CPU only. No training, no tracking, no VLM.
+CCTV incident detection prototype (V1.2) -- YOLO-World + prompts + small
+dedicated pretrained models + temporal confirmation, CPU only.
 
 Every run also produces output/report.html: a self-contained analysis
-page showing, per category, the highest confidence YOLO-World actually
+page showing, per category, the highest confidence the pipeline actually
 reached (even below your threshold), whether it was confirmed, and
 thumbnail crops of the best moments -- useful when something you expect
-to be flagged isn't.
+to be flagged isn't (or something you DON'T expect to be flagged is).
 
 Usage:
     python main.py --input input/test.mp4
@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -50,6 +51,67 @@ def print_banner(input_path, process_fps):
     print("=" * 40)
 
 
+def _threshold_for(det):
+    """
+    FIRE/SMOKE (and potentially WEAPON, once calibrated) can come from
+    more than one model source with different confidence scales -- check
+    config.SOURCE_CONFIDENCE_THRESHOLDS (matched against the START of
+    Detection.prompt) before falling back to the shared per-category
+    CONFIDENCE_THRESHOLDS.
+    """
+    for prefix, thr in config.SOURCE_CONFIDENCE_THRESHOLDS.items():
+        if det.prompt and det.prompt.startswith(prefix):
+            return thr
+    return config.CONFIDENCE_THRESHOLDS.get(det.category, 0.4)
+
+
+def _suppress_by_confirmed_events(raw_detections):
+    """
+    Cross-category suppression for suppressors that are REAL alert
+    categories (FIRE, SMOKE) rather than suppressor-only prompts like
+    ANIMAL (ANIMAL is already handled inside detector.py).
+
+    This has to run HERE, after zero-shot and multi-model (Thalos)
+    detections are merged, because a fire might be caught by only ONE of
+    the two sources on a given frame -- doing this suppression inside
+    detector.py would only ever see zero-shot's own FIRE/SMOKE hits and
+    miss a fire that only Thalos detected (or vice versa).
+
+    A FIRE/SMOKE detection only counts as a valid suppressor once it
+    clears ITS OWN real alert threshold (via _threshold_for(), the same
+    per-source logic used for the main alert pipeline) -- floor-level
+    noise shouldn't be able to suppress a detection in another category.
+
+    This is what fixes the car-fire clip where smoke was scoring 0.92+
+    as FALLEN_TREE and flame/debris shapes were scoring 0.83+ as WEAPON:
+    once FIRE/SMOKE themselves clear threshold in the same frame and
+    overlap those boxes, the false positives are dropped.
+    """
+    to_drop = set()
+    for target_category, suppressor_entries in config.SUPPRESSED_BY.items():
+        for entry in suppressor_entries:
+            suppressor_category = entry["category"]
+            if suppressor_category in config.SUPPRESSOR_CATEGORIES:
+                continue  # handled already inside detector.py (e.g. ANIMAL)
+
+            iou_threshold = entry["iou"]
+            suppressors = [
+                d for d in raw_detections
+                if d.category == suppressor_category and d.confidence >= _threshold_for(d)
+            ]
+            if not suppressors:
+                continue
+
+            for i, det in enumerate(raw_detections):
+                if det.category != target_category or i in to_drop:
+                    continue
+                for sup in suppressors:
+                    if IncidentDetector._iou(det.bbox, sup.bbox) >= iou_threshold:
+                        to_drop.add(i)
+                        break
+    return [d for i, d in enumerate(raw_detections) if i not in to_drop]
+
+
 def main():
     args = parse_args()
     print_banner(args.input, config.PROCESS_FPS)
@@ -67,6 +129,19 @@ def main():
         source.release()
         sys.exit(1)
 
+    # Small dedicated pretrained models -- FIRE/SMOKE/spark (Thalos),
+    # FIGHT, WEAPON-firearms, plus THEFT/DOG_ATTACK raw signal boxes
+    # (not alert-ready yet, see multi_model_detector.py). Optional --
+    # if this fails to load (missing package, no internet for the first
+    # download), fall back to YOLO-World-only behavior rather than
+    # crashing the whole run.
+    try:
+        from multi_model_detector import build_registry
+        multi_models = build_registry(roboflow_api_key=os.environ.get("ROBOFLOW_API_KEY"))
+    except Exception as e:
+        print(f"WARNING: multi-model registry failed to load ({e}) -- continuing with YOLO-World only.")
+        multi_models = {}
+
     try:
         sink = VideoSink(args.output, source.fps, source.width, source.height)
     except RuntimeError as e:
@@ -78,7 +153,10 @@ def main():
     alert_engine = AlertEngine()
 
     # --- report-tracking state: independent of the alert pipeline ---
-    categories = list(config.CATEGORY_PROMPTS.keys())
+    # FIGHT/ELECTRICAL aren't in CATEGORY_PROMPTS (they have no YOLO-World
+    # prompts -- they come from multi_model_detector.py instead), so they
+    # need to be added explicitly or the report/temporal loop never sees them.
+    categories = list(config.CATEGORY_PROMPTS.keys()) + config.MODEL_BASED_CATEGORIES
     report_stats = {
         c: {
             "threshold": config.CONFIDENCE_THRESHOLDS.get(c, 0.4),
@@ -87,7 +165,7 @@ def main():
             "max_confidence": 0.0,
             "confirmed": False,
             "timeline": [],          # (frame_idx, confidence) per sampled frame
-            "top_detections": [],    # (frame_idx, timestamp, confidence, thumb_b64)
+            "top_detections": [],    # (frame_idx, timestamp, confidence, thumb_b64, source)
         }
         for c in categories
     }
@@ -112,6 +190,35 @@ def main():
                 except Exception as e:
                     print(f"WARNING: inference failed on frame {frame_idx}: {e}")
                     raw_detections = []
+
+                # Run the small dedicated models on the same sampled frame
+                # and merge their output in. THEFT_SIGNAL/DOG_ATTACK_SIGNAL
+                # are dropped here -- they're raw person/dog/bag boxes, not
+                # alert-ready categories, and must never reach the temporal
+                # tracker (see config.SIGNAL_ONLY_CATEGORIES).
+                multi_detections = []
+                for model_name, model in multi_models.items():
+                    try:
+                        dets = model.detect(frame)
+                    except Exception as e:
+                        print(f"WARNING: {model_name} inference failed on frame {frame_idx}: {e}")
+                        dets = []
+                    multi_detections.extend(
+                        d for d in dets if d.category not in config.SIGNAL_ONLY_CATEGORIES
+                    )
+                if multi_detections:
+                    # reuse detector.py's own IoU dedupe so two models
+                    # firing on the same WEAPON box don't draw/count twice
+                    raw_detections = detector._dedupe(raw_detections + multi_detections)
+
+                # Cross-category suppression for FIRE/SMOKE -> WEAPON /
+                # FALLEN_TREE. Must run AFTER the merge above so it sees
+                # Thalos's FIRE/SMOKE detections too, not just zero-shot's.
+                # (ANIMAL -> FALLEN_PERSON suppression already happened
+                # inside detector.infer_raw(), since ANIMAL has no
+                # multi-model equivalent.)
+                raw_detections = _suppress_by_confirmed_events(raw_detections)
+
                 inference_time_total += time.time() - t0
                 frames_inferred += 1
 
@@ -132,14 +239,14 @@ def main():
                     if det:
                         thumbs = report_stats[c]["top_detections"]
                         thumb_b64 = encode_thumbnail(frame, det.bbox)
-                        thumbs.append((frame_idx, timestamp, conf, thumb_b64))
+                        thumbs.append((frame_idx, timestamp, conf, thumb_b64, det.prompt))
                         thumbs.sort(key=lambda t: t[2], reverse=True)
                         del thumbs[config.REPORT_TOP_K_PER_CATEGORY:]
 
                 # filtered detections (what the real pipeline uses)
                 detections = [
                     det for det in raw_detections
-                    if det.confidence >= config.CONFIDENCE_THRESHOLDS.get(det.category, 0.4)
+                    if det.confidence >= _threshold_for(det)
                 ]
 
                 confirmed = tracker.update(detections)
@@ -152,7 +259,7 @@ def main():
                             alert = alert_engine.maybe_alert(category, rep, frame_idx, source.fps)
                             if alert:
                                 print(f"ALERT: {alert['event']} at {alert['timestamp']} "
-                                      f"(conf={alert['confidence']}, frame={alert['frame']})")
+                                      f"(conf={alert['confidence']}, source={alert['source']}, frame={alert['frame']})")
 
                 last_detections = detections
                 last_confirmed = confirmed

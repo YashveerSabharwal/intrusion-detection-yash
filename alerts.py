@@ -42,6 +42,12 @@ class AlertEngine:
             "confidence": round(float(detection.confidence), 3),
             "bbox": [int(v) for v in detection.bbox],
             "frame": int(frame_number),
+            # NEW: which zero-shot prompt or which dedicated model produced
+            # this detection, e.g. "person holding a rifle", "firearm_yolo:gun",
+            # "thalos:fire". Without this there was no way to tell, after the
+            # fact, which of WEAPON's two sources (zero-shot vs firearm_yolo)
+            # triggered a given alert -- needed this to diagnose false positives.
+            "source": detection.prompt,
         }
         self.alerts.append(alert)
         self.last_alert_time[category] = video_seconds
